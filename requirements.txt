@@ -1,0 +1,24 @@
+# ============ AI Agent 智能任务编排平台 · 依赖清单 ============
+# 安装：python -m venv .venv && .venv\Scripts\activate && pip install -r requirements.txt
+# 说明：Python 3.10+（推荐 3.11）；若使用 conda 可直接 pip install -r requirements.txt
+
+# ---- Agent / LLM ----
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-openai>=0.3.0
+python-dotenv>=1.0.0
+
+# ---- 后端 API（python-multipart 为 /upload 文件上传必需）----
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+pydantic>=2.0.0
+
+# ---- 前端 ----
+streamlit>=1.40.0
+requests>=2.31.0
+
+# ---- 数据处理与可视化 ----
+pandas>=2.0.0
+matplotlib>=3.8.0
+chardet>=5.2.0

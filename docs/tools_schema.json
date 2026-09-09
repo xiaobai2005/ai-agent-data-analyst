@@ -1,0 +1,269 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "数据分析 Agent 自定义工具集",
+  "description": "本文件定义「智能数据分析助手」AI Agent 的全部自定义工具。每个工具均由 Python 函数经 LangChain @tool 装饰器注册，下方 JSON Schema 用于对外暴露、集成与文档化（与 tools/*.py 实现一一对应）。所有工具统一约定：入参为具名 JSON 字段，返回值为字符串（Markdown / 纯文本 / 相对路径）。",
+  "version": "1.0.0",
+  "base_directory_constraint": {
+    "description": "除显式说明外，csv_path 仅接受相对路径（相对工作目录），禁止绝对路径与 '..' 父目录穿越；所有文件读写经 guard.safe_path 校验。",
+    "forbidden": ["绝对路径", "包含 '..' 的路径"]
+  },
+  "tools": {
+    "profile_csv": {
+      "name": "profile_csv",
+      "type": "function",
+      "description": "分析 CSV 数据结构，自动检测编码、列类型、缺失值、唯一值基数与数值列统计，返回一份「数据画像」文本。建议在对话首轮或文件切换时优先调用，以了解数据。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          }
+        },
+        "required": ["csv_path"]
+      },
+      "returns": "字符串：行数/列数/检测编码/列类型/缺失值字典/唯一值基数/统计概览。",
+      "example": { "csv_path": "demo.csv" }
+    },
+    "read_csv": {
+      "name": "read_csv",
+      "type": "function",
+      "description": "读取 CSV 文件并返回前 N 行预览，用于快速了解数据内容。文件不存在或为空时返回人话提示而非崩溃。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          },
+          "nrows": {
+            "type": "integer",
+            "description": "预览行数，默认 5。",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": ["file_path"]
+      },
+      "returns": "字符串：总行数 + 列名列表 + 前 N 行表格。",
+      "example": { "file_path": "demo.csv", "nrows": 5 }
+    },
+    "sql_query": {
+      "name": "sql_query",
+      "type": "function",
+      "description": "对 CSV 数据执行只读 SQL 查询（结果最多返回 20 行）。CSV 首次会被自动导入 SQLite，表名等于文件名去后缀。安全护栏仅放行以 SELECT 开头的查询，并硬拦截 DROP/DELETE/UPDATE/INSERT/ALTER/CREATE 等危险关键字。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          },
+          "sql": {
+            "type": "string",
+            "description": "只读 SQL 查询语句，必须以 SELECT 开头，不包含任何写/破坏关键字。",
+            "examples": [
+              "SELECT region, SUM(quantity) FROM demo GROUP BY region",
+              "SELECT * FROM demo WHERE price > 100"
+            ]
+          }
+        },
+        "required": ["csv_path", "sql"]
+      },
+      "returns": "字符串：查询结果表格（最多 20 行）；若触发危险语句则返回拦截提示。",
+      "example": { "csv_path": "demo.csv", "sql": "SELECT region, SUM(quantity) FROM demo GROUP BY region" }
+    },
+    "stats_summary": {
+      "name": "stats_summary",
+      "type": "function",
+      "description": "对 CSV 所有数值列计算描述统计：均值、中位数、标准差、最小值、最大值、分位数等。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          }
+        },
+        "required": ["csv_path"]
+      },
+      "returns": "字符串：pandas describe() 结果（保留 4 位小数）。",
+      "example": { "csv_path": "demo.csv" }
+    },
+    "stats_value_counts": {
+      "name": "stats_value_counts",
+      "type": "function",
+      "description": "统计 CSV 某一列中每个值出现的次数。列名不存在时返回可用列提示，便于模型自我纠正。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          },
+          "column": {
+            "type": "string",
+            "description": "需要计数的列名，须存在于 CSV 中。"
+          }
+        },
+        "required": ["csv_path", "column"]
+      },
+      "returns": "字符串：各取值及其出现次数（降序）。",
+      "example": { "csv_path": "demo.csv", "column": "product" }
+    },
+    "stats_group_agg": {
+      "name": "stats_group_agg",
+      "type": "function",
+      "description": "按某列分组，对另一数值列计算总和与平均值。示例：group_by='region', column='quantity' 得到各地区销量统计。分组列与数值列均须存在。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          },
+          "group_by": {
+            "type": "string",
+            "description": "分组列名（如 region / product / date）。"
+          },
+          "column": {
+            "type": "string",
+            "description": "待聚合的数值列名（如 quantity / price）。"
+          }
+        },
+        "required": ["csv_path", "group_by", "column"]
+      },
+      "returns": "字符串：分组后的 sum 与 mean 结果（保留 4 位小数）。",
+      "example": { "csv_path": "demo.csv", "group_by": "region", "column": "quantity" }
+    },
+    "stats_mom": {
+      "name": "stats_mom",
+      "type": "function",
+      "description": "计算环比（逐期增长率 %）：按 date_col 分组对 value_col 求和，再计算相邻期变化率。示例：date_col='date', value_col='quantity' 得到每日销量环比增长。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          },
+          "date_col": {
+            "type": "string",
+            "description": "日期列名，用于排序与分期。"
+          },
+          "value_col": {
+            "type": "string",
+            "description": "数值列名，参与求和与环比计算。"
+          }
+        },
+        "required": ["csv_path", "date_col", "value_col"]
+      },
+      "returns": "字符串：日期 / 数值 / 环比% 三列表格。",
+      "example": { "csv_path": "demo.csv", "date_col": "date", "value_col": "quantity" }
+    },
+    "stats_yoy": {
+      "name": "stats_yoy",
+      "type": "function",
+      "description": "计算同比（年增长率 %）：把 date_col 解析为日期，按年汇总 value_col，再计算年度变化率。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          },
+          "date_col": {
+            "type": "string",
+            "description": "日期列名，须可解析为日期。"
+          },
+          "value_col": {
+            "type": "string",
+            "description": "数值列名，参与求和与同比计算。"
+          }
+        },
+        "required": ["csv_path", "date_col", "value_col"]
+      },
+      "returns": "字符串：年份 / 数值 / 同比% 三列表格。",
+      "example": { "csv_path": "demo.csv", "date_col": "date", "value_col": "quantity" }
+    },
+    "make_chart": {
+      "name": "make_chart",
+      "type": "function",
+      "description": "生成可视化图表并保存为 PNG。支持 line(折线)/bar(柱状)/scatter(散点)/hist(直方图)/pie(饼图)；hist 与 pie 不需要 y 参数。x、y 为 CSV 列名，返回保存的相对路径（如 charts/chart_bar_region_xxxxxxxx.png），需在回复中以 Markdown 图片语法嵌入。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "CSV 文件路径（相对路径，经安全校验）。"
+          },
+          "chart_type": {
+            "type": "string",
+            "enum": ["line", "bar", "scatter", "hist", "pie"],
+            "description": "图表类型，仅限上述枚举值（白名单）。"
+          },
+          "x": {
+            "type": "string",
+            "description": "横轴列名（饼图不传 y 时按 x 计数）。"
+          },
+          "y": {
+            "type": "string",
+            "description": "纵轴列名；line/bar/scatter 必填，hist/pie 可省略。",
+            "default": ""
+          }
+        },
+        "required": ["csv_path", "chart_type", "x"]
+      },
+      "returns": "字符串：\"图表已保存: charts/chart_xxx.png\"，或列不存在 / 类型非法提示。",
+      "example": { "csv_path": "demo.csv", "chart_type": "bar", "x": "region", "y": "quantity" }
+    },
+    "calculator": {
+      "name": "calculator",
+      "type": "function",
+      "description": "安全计算纯算术表达式（如 (3+5)*12 或 2**10）。仅允许数字与 + - * / ( ) . % 运算符，禁用任何字母；同时清空内置环境、限制嵌套乘方，杜绝代码注入与卡死。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string",
+            "description": "纯算术表达式，长度 1-100 字符，仅含数字与运算符。",
+            "maxLength": 100,
+            "pattern": "^[\\d\\s\\+\\-\\*/\\.\\(\\)%]+$"
+          }
+        },
+        "required": ["expression"]
+      },
+      "returns": "字符串：计算结果，或字符非法/除零/超长等错误提示。",
+      "example": { "expression": "(3+5)*12" }
+    },
+    "report_tool": {
+      "name": "report_tool",
+      "type": "function",
+      "description": "把本轮分析整理成 Markdown 结构化报告并保存到 reports/（文件名带时间戳）。markdown_body 可含数据表格、文字结论与图表路径引用；返回报告文件路径供下载或前端展示。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "markdown_body": {
+            "type": "string",
+            "description": "报告正文（Markdown，可含表格、结论、图表引用）。"
+          },
+          "title": {
+            "type": "string",
+            "description": "报告标题，默认「数据分析报告」。",
+            "default": "数据分析报告"
+          }
+        },
+        "required": ["markdown_body"]
+      },
+      "returns": "字符串：\"报告已生成: reports/report_xxx.md\"。",
+      "example": { "markdown_body": "## 关键发现\\n- 上海销量最高 ...", "title": "地区销量分析" }
+    }
+  },
+  "shared_guardrails": {
+    "path_guard": "guard.safe_path：禁止绝对路径与 '..' 穿越，可选 base_dir 限制目录范围。",
+    "sql_guard": "sql_query 仅放行 SELECT，正则硬拦截 DROP/DELETE/UPDATE/INSERT/REPLACE/ALTER/CREATE/TRUNCATE/ATTACH/PRAGMA/VACUUM，并以只读连接（mode=ro）执行。",
+    "calc_guard": "calculator 字符白名单 + 空内置环境 + 禁止嵌套乘方 + 长度上限。",
+    "hitl": "agent.py 对「删除意图 + 文件对象」的高风险操作触发 HITL，暂停并等待前端二次确认（POST /confirm）后方可执行。"
+  }
+}
