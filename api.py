@@ -53,6 +53,8 @@ class ChatResponse(BaseModel):
     images: list[str] = []
     steps: list[dict] = []
     tokens: dict = {"prompt": 0, "completion": 0, "total": 0}
+    trace: list[dict] = []          # 完整推理过程（thought/action/observation），供前端常驻展示
+    latency_ms: int = 0
     needs_confirm: bool = False
     confirm_payload: dict | None = None
 
@@ -102,6 +104,8 @@ def chat_endpoint(req: ChatRequest, request: Request):
         images=urls,
         steps=result.get("steps", []),
         tokens=result.get("tokens", {"prompt": 0, "completion": 0, "total": 0}),
+        trace=result.get("trace", []),
+        latency_ms=int(result.get("latency_ms", 0) or 0),
         needs_confirm=result.get("needs_confirm", False),
         confirm_payload=result.get("confirm_payload"),
     )
@@ -141,10 +145,33 @@ def tools_endpoint():
     return {"count": len(agent.tool_catalog()), "tools": agent.tool_catalog()}
 
 
-# ============ 执行日志 ============
+# ============ 执行日志 / 推理轨迹（落盘可追溯，重启不丢）============
 @app.get("/logs/{session_id}")
-def logs_endpoint(session_id: str):
-    return {"session_id": session_id, "logs": agent.get_logs(session_id)}
+def logs_endpoint(session_id: str, limit: int = 50, date: str = ""):
+    """查询某会话的完整推理轨迹（含 Thought/Action/Observation）。
+
+    - limit：最多返回条数，默认 50（最新在前）
+    - date ：指定日期 YYYYMMDD，为空则回溯最近若干天
+    """
+    logs = agent.get_logs(session_id, limit=limit, date=date)
+    return {"session_id": session_id, "count": len(logs), "logs": logs}
+
+
+@app.get("/traces")
+def traces_endpoint(session_id: str = "", limit: int = 50, date: str = ""):
+    """跨会话查询推理轨迹；session_id 为空时返回全部会话的最新轨迹"""
+    import trace_logger
+
+    rows = trace_logger.read_traces(session_id=session_id, date=date, limit=limit)
+    return {"count": len(rows), "traces": rows}
+
+
+@app.get("/traces/dates")
+def trace_dates_endpoint():
+    """列出已产生轨迹日志的日期（YYYYMMDD，新的在前）"""
+    import trace_logger
+
+    return {"dates": trace_logger.list_dates()}
 
 
 # ============ CSV 上传 ============

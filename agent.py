@@ -15,6 +15,8 @@ from langchain.agents import create_agent
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
+import trace_logger
+
 from llm import llm
 from tools.registry import get_tools, prompt_catalog
 
@@ -151,6 +153,34 @@ def _last_ai_text(messages) -> str:
     return ""
 
 
+def _text_of(msg) -> str:
+    """取消息的文本内容（兼容字符串与分块列表两种返回格式）"""
+    text = getattr(msg, "content", "")
+    if isinstance(text, list):
+        text = "".join(c.get("text", "") for c in text if isinstance(c, dict))
+    return str(text or "")
+
+
+def _messages_to_events(messages) -> list[dict]:
+    """把一次性调用得到的消息序列还原成与 SSE 同构的事件序列，
+    保证 /chat 与 /chat/stream 两条路径落盘的推理轨迹一致。"""
+    events: list[dict] = []
+    for m in messages or []:
+        if isinstance(m, AIMessage):
+            text = _text_of(m)
+            if text.strip():
+                events.append({"type": "thought", "text": text})
+            for tc in (m.tool_calls or []):
+                events.append({"type": "action",
+                               "tool": tc.get("name", ""),
+                               "args": tc.get("args", {})})
+        elif isinstance(m, ToolMessage):
+            events.append({"type": "observation",
+                           "tool": m.name or "",
+                           "text": _text_of(m)[:500]})
+    return events
+
+
 def invoke_once(messages: list) -> dict:
     """跑一次完整的 ReAct 循环（框架托管 思考→调用工具→回填→继续）"""
     collector = StepCollector()
@@ -233,8 +263,12 @@ def chat(session_id: str, user_input: str, csv_path: str = "",
     # ---------- 守门：未加载数据文件时直接提示，避免下游误读 ----------
     csv_path = (csv_path or "").strip()
     if not csv_path:
+        reply = ("⚠️ 尚未加载数据文件。请先在左侧【上传 CSV】，"
+                 "或点击「使用示例数据」加载 demo.csv。")
+        _append_log(session_id, user_input, reply, [], mode="guard",
+                    error="no_data_file")
         return {
-            "reply": "⚠️ 尚未加载数据文件。请先在左侧【上传 CSV】，或点击「使用示例数据」加载 demo.csv。",
+            "reply": reply,
             "images": [], "steps": [], "tokens": dict(EMPTY_TOKENS),
             "needs_confirm": False, "confirm_payload": None,
         }
@@ -242,9 +276,12 @@ def chat(session_id: str, user_input: str, csv_path: str = "",
     # ---------- HITL 预检：高风险"删除文件"类操作先暂停等人工确认 ----------
     if _DELETE_RE.search(user_input) and _FILE_RE.search(user_input):
         _pending[session_id] = {"action": "delete_file", "path": csv_path}
+        reply = ("⚠️ 检测到高风险操作（删除文件），已按安全护栏暂停。"
+                 "请在前端点击【确认执行】；忽略即可取消。")
+        _append_log(session_id, user_input, reply, [], mode="guard",
+                    csv_path=csv_path, error="hitl_paused")
         return {
-            "reply": "⚠️ 检测到高风险操作（删除文件），已按安全护栏暂停。"
-                     "请在前端点击【确认执行】；忽略即可取消。",
+            "reply": reply,
             "images": [], "steps": [], "tokens": dict(EMPTY_TOKENS),
             "needs_confirm": True,
             "confirm_payload": {"action": "delete_file", "path": csv_path},
@@ -256,23 +293,34 @@ def chat(session_id: str, user_input: str, csv_path: str = "",
     history.append({"role": "user", "content": user_input})
 
     # ---------- ReAct 推理循环 ----------
+    t0 = time.time()
+    error = ""
     try:
         result = invoke_once([SystemMessage(content=sys_text)] + history)
     except Exception as e:
+        error = f"{type(e).__name__}: {e}"
         result = {"reply": f"Agent 执行失败：{type(e).__name__}: {e}",
                   "images": [], "steps": [], "tokens": dict(EMPTY_TOKENS),
                   "messages": []}
+    latency_ms = int((time.time() - t0) * 1000)
 
     # 存回历史：只保留 user/ai/tool 消息（system 每轮动态注入，避免堆积）
     if result.get("messages"):
         _sessions[session_id] = list(result["messages"])[1:] or history
-    _append_log(session_id, user_input, result["reply"], result["images"])
+    events = _messages_to_events(result.get("messages") or [])
+    _append_log(
+        session_id, user_input, result["reply"], result["images"],
+        events=events, steps=result["steps"], tokens=result["tokens"],
+        latency_ms=latency_ms, csv_path=csv_path, mode="once", error=error,
+    )
 
     return {
         "reply": result["reply"],
         "images": result["images"],
         "steps": result["steps"],
         "tokens": result["tokens"],
+        "trace": events,          # 供前端常驻展示「推理过程」（与 SSE 事件同构）
+        "latency_ms": latency_ms,
         "needs_confirm": False,
         "confirm_payload": None,
     }
@@ -283,16 +331,21 @@ def stream_chat(session_id: str, user_input: str, csv_path: str = "",
     """chat() 的流式版本：以生成器逐步产出 ReAct 事件，供 SSE 接口推送"""
     csv_path = (csv_path or "").strip()
     if not csv_path:
+        reply = ("⚠️ 尚未加载数据文件。请先在左侧【上传 CSV】，"
+                 "或点击「使用示例数据」加载 demo.csv。")
+        _append_log(session_id, user_input, reply, [], mode="guard",
+                    error="no_data_file")
         yield {"type": "error", "text": "⚠️ 尚未加载数据文件，请先上传 CSV。"}
-        yield {"type": "final", "reply": "⚠️ 尚未加载数据文件。请先在左侧【上传 CSV】，"
-                                         "或点击「使用示例数据」加载 demo.csv。",
+        yield {"type": "final", "reply": reply,
                "images": [], "steps": [], "tokens": dict(EMPTY_TOKENS)}
         return
 
     if _DELETE_RE.search(user_input) and _FILE_RE.search(user_input):
         _pending[session_id] = {"action": "delete_file", "path": csv_path}
-        yield {"type": "final",
-               "reply": "⚠️ 检测到高风险操作（删除文件），已按安全护栏暂停。",
+        reply = "⚠️ 检测到高风险操作（删除文件），已按安全护栏暂停。"
+        _append_log(session_id, user_input, reply, [], mode="guard",
+                    csv_path=csv_path, error="hitl_paused")
+        yield {"type": "final", "reply": reply,
                "images": [], "steps": [], "tokens": dict(EMPTY_TOKENS),
                "needs_confirm": True,
                "confirm_payload": {"action": "delete_file", "path": csv_path}}
@@ -303,21 +356,34 @@ def stream_chat(session_id: str, user_input: str, csv_path: str = "",
     history = _sessions.setdefault(session_id, [])
     history.append({"role": "user", "content": user_input})
 
+    t0 = time.time()
+    events: list[dict] = []
     for ev in iter_react_events([SystemMessage(content=sys_text)] + history):
         if ev["type"] == "final":
             history.append({"role": "assistant", "content": ev["reply"]})
-            _append_log(session_id, user_input, ev["reply"], ev["images"])
+            _append_log(
+                session_id, user_input, ev["reply"], ev["images"],
+                events=events, steps=ev["steps"], tokens=ev["tokens"],
+                latency_ms=int((time.time() - t0) * 1000),
+                csv_path=csv_path, mode="stream",
+            )
+        else:
+            events.append(ev)
         yield ev
 
 
-def _append_log(session_id: str, user_input: str, reply: str, images: list):
-    """记录执行日志，供 GET /logs/{session_id} 查询"""
-    _logs.setdefault(session_id, []).append({
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "user": user_input,
-        "reply": reply,
-        "images": images,
-    })
+def _append_log(session_id: str, user_input: str, reply: str, images: list,
+                events: list[dict] | None = None, steps: list[dict] | None = None,
+                tokens: dict | None = None, latency_ms: int = 0,
+                csv_path: str = "", mode: str = "once", error: str = ""):
+    """记录一轮对话的完整轨迹：内存一份（快速回看）+ 磁盘一份（重启可追溯）"""
+    record = trace_logger.build_record(
+        session_id=session_id, question=user_input, csv_path=csv_path, mode=mode,
+        events=events or [], steps=steps or [], tokens=tokens,
+        reply=reply, images=images or [], latency_ms=latency_ms, error=error,
+    )
+    _logs.setdefault(session_id, []).append(record)
+    trace_logger.write_trace(record)      # 落盘失败不影响主流程（内部已兜底）
 
 
 # ============ 供 API 层调用的辅助函数 ============
@@ -329,9 +395,18 @@ def tool_catalog() -> list[dict]:
             for t in REGISTERED_TOOLS]
 
 
-def get_logs(session_id: str) -> list:
-    """返回某会话的执行日志，供 GET /logs/{session_id}"""
-    return _logs.get(session_id, [])
+def get_logs(session_id: str, limit: int = 50, date: str = "") -> list:
+    """返回某会话的执行轨迹（含完整推理过程），供 GET /logs/{session_id}
+
+    优先读磁盘（后端重启后仍可追溯），磁盘无记录时回退到内存。
+    """
+    try:
+        disk = trace_logger.read_traces(session_id=session_id, date=date, limit=limit)
+    except Exception:
+        disk = []
+    if disk:
+        return disk
+    return list(_logs.get(session_id, []))[-limit:] if limit > 0 else _logs.get(session_id, [])
 
 
 def confirm_action(session_id: str) -> dict:

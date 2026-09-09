@@ -181,6 +181,7 @@ ai-agent-data-analyst/
 │
 ├── scripts/                   # 一键启动脚本（Windows bat + Linux sh）
 ├── docs/                      # 文档：架构 / 工具 / API / 部署 / 评估 / 交付清单
+├── logs/                      # 推理轨迹日志 trace_YYYYMMDD.jsonl（运行产物，可追溯）
 ├── charts/                    # 生成的图表 PNG（运行产物）
 ├── reports/                   # 生成的 Markdown 报告（运行产物）
 ├── uploads/                   # 上传的 CSV（运行产物）
@@ -285,6 +286,43 @@ sequenceDiagram
 护栏压力测试用例已包含在 `tests/tasks.json`（第 19–22 条：缺失值、不存在的列、删除文件、DROP TABLE）。
 
 ---
+
+## 八之二、推理过程留存与日志追溯
+
+Agent 的每一步推理都不会"一闪而过"，而是**同时在页面留存 + 落盘可查**：
+
+**① 页面上常驻**：每条回答**上方**有「推理过程 · N 步」折叠面板，完整展示
+Thought（思考）→ Action（工具 + 参数）→ Observation（结果）链路；
+流式结束后面板不会被清空，历史消息随时可重新展开回看。
+
+**② 落盘可追溯**：每轮对话写一条 JSONL 记录到 `logs/trace_YYYYMMDD.jsonl`（按天切分、线程安全追加）：
+
+```json
+{"ts":"2026-09-10 14:03:21","session_id":"s1","mode":"stream","csv_path":"demo.csv",
+ "events":[{"type":"thought","text":"…"},{"type":"action","tool":"stats_group_agg","args":"{…}"},
+           {"type":"observation","tool":"stats_group_agg","text":"…"}],
+ "steps":[{"tool":"stats_group_agg","args":"{…}","latency_ms":3,"summary":"…"}],
+ "tokens":{"prompt":5076,"completion":334,"total":5410},
+ "latency_ms":8420,"images":["charts/xxx.png"],"time":"…","user":"…","reply":"…"}
+```
+
+**③ 接口回查**（后端重启后依然可查）：
+
+```bash
+curl "http://localhost:8000/logs/{session_id}?limit=20"   # 某会话的完整推理轨迹
+curl "http://localhost:8000/traces?limit=20"              # 跨会话最新轨迹
+curl "http://localhost:8000/traces/dates"                 # 有日志的日期列表
+```
+
+| 字段 | 含义 |
+|---|---|
+| `events` | 完整推理过程（thought / action / observation / error） |
+| `steps` | 工具调用明细（工具名 / 入参 / 耗时 / 结果摘要） |
+| `tokens` | prompt / completion / total 用量 |
+| `latency_ms` | 端到端耗时 |
+| `mode` | `once` 一次性 / `stream` SSE / `guard` 被护栏拦截 |
+
+> 落盘失败不会影响对话（内部兜底只告警）；`logs/*.jsonl` 已被 `.gitignore` 忽略，不会进仓库。
 
 ## 九、量化评估
 

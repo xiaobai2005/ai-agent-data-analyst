@@ -12,7 +12,9 @@
 | POST | `/chat` | 对话（一次性返回结果） |
 | POST | `/chat/stream` | 对话（**SSE 流式**推送推理过程） |
 | GET | `/tools` | 已注册工具列表（含风险等级） |
-| GET | `/logs/{session_id}` | 指定会话的执行日志 |
+| GET | `/logs/{session_id}` | 指定会话的**完整推理轨迹**（读磁盘，重启可查），支持 `limit`/`date` |
+| GET | `/traces` | 跨会话查询推理轨迹，支持 `session_id`/`limit`/`date` |
+| GET | `/traces/dates` | 列出已有轨迹日志的日期 |
 | POST | `/confirm` | HITL 高风险操作二次确认 |
 | GET | `/reports` | 已生成的 Markdown 报告列表 |
 | GET | `/reports/{filename}` | 下载指定报告 |
@@ -68,10 +70,60 @@ curl -X POST http://localhost:8000/chat -H "Content-Type: application/json" -d '
 
 ### GET /logs/{session_id}
 
+返回该会话的完整推理轨迹（**读磁盘 JSONL，后端重启后仍可查**）。
+
 ```bash
-curl http://localhost:8000/logs/s1
-# {"session_id":"s1","logs":[{"time":"...","user":"...","reply":"...","images":[]}]}
+curl "http://localhost:8000/logs/s1?limit=20"
+curl "http://localhost:8000/logs/s1?date=20260910&limit=50"
 ```
+
+```json
+{
+  "session_id": "s1",
+  "count": 2,
+  "logs": [
+    {
+      "ts": "2026-09-10 14:03:21", "session_id": "s1", "mode": "stream",
+      "csv_path": "demo.csv", "latency_ms": 8420,
+      "events": [
+        {"type": "thought", "text": "需要先按地区聚合销量"},
+        {"type": "action", "tool": "stats_group_agg", "args": "{\"group_by\": \"region\"}"},
+        {"type": "observation", "tool": "stats_group_agg", "text": "   sum   mean ..."}
+      ],
+      "steps": [{"tool": "stats_group_agg", "args": "{...}", "latency_ms": 3, "summary": "..."}],
+      "tokens": {"prompt": 5076, "completion": 334, "total": 5410},
+      "event_count": 3, "tool_count": 1,
+      "time": "2026-09-10 14:03:21", "user": "按地区统计销量", "reply": "...", "images": []
+    }
+  ]
+}
+```
+
+**参数**：`limit`（默认 50，最新在前）、`date`（`YYYYMMDD`，为空则回溯最近 7 天）
+
+**mode 取值**：`once` 一次性 `/chat`、`stream` SSE `/chat/stream`、`guard` 被护栏拦截（未加载数据 / HITL 暂停）
+
+### GET /traces
+
+跨会话查询轨迹；`session_id` 为空时返回全部会话的最新轨迹。
+
+```bash
+curl "http://localhost:8000/traces?limit=10"
+curl "http://localhost:8000/traces?session_id=s1&limit=20"
+# {"count":1,"traces":[{...}]}
+```
+
+### GET /traces/dates
+
+```bash
+curl http://localhost:8000/traces/dates
+# {"dates":["20260910","20260909"]}
+```
+
+### 轨迹落盘位置
+
+`logs/trace_YYYYMMDD.jsonl`（按天切分，线程安全追加）。单条记录字段见上；
+`thought` 截断 2000 字符、`observation` 截断 1000 字符，避免长表格撑爆日志。
 
 ### POST /confirm（HITL）
 

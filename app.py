@@ -438,6 +438,8 @@ with st.sidebar:
     st.markdown('<div class="panel-title" style="margin-top:18px">推理过程</div>',
                 unsafe_allow_html=True)
     st.toggle("SSE 流式输出（实时显示 思考 / 工具调用 / 结果）", key="use_sse", value=False)
+    st.caption("每轮推理过程随消息常驻保留，并落盘到 logs/trace_日期.jsonl，"
+               "可用 GET /logs/{session_id} 回查。")
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
     if st.button("清空当前对话", use_container_width=True):
@@ -503,8 +505,32 @@ def render_timeline(steps: list):
             st.caption(str(s.get("summary", ""))[:400])
 
 
+def render_trace(trace: list):
+    """推理过程：Thought / Action / Observation 完整链路（常驻折叠，可反复展开）"""
+    shown = [e for e in trace if e.get("type") in ("thought", "action", "observation", "error")]
+    with st.expander(f"推理过程 · {len(shown)} 步", expanded=False):
+        for i, ev in enumerate(shown, 1):
+            t = ev.get("type")
+            if t == "thought":
+                st.markdown(f"**思考 · {i:02d}**")
+                st.markdown(str(ev.get("text", "")))
+            elif t == "action":
+                args = json.dumps(ev.get("args", {}), ensure_ascii=False)
+                st.markdown(
+                    f'<div class="msg-meta"><b>调用 · {i:02d}</b>'
+                    f'<span>{html.escape(str(ev.get("tool", "?")))}</span></div>',
+                    unsafe_allow_html=True,
+                )
+                st.code(args, language="json")
+            elif t == "observation":
+                st.caption(f"← {ev.get('tool', '')} 返回：" + str(ev.get("text", ""))[:400])
+            elif t == "error":
+                st.error(str(ev.get("text", "")))
+
+
 def render_assistant(msg: dict):
     steps = msg.get("steps", [])
+    trace = msg.get("trace") or []
     tokens = msg.get("tokens") or {}
     total = int(tokens.get("total", 0) or 0)
     latency = msg.get("latency_s", 0)
@@ -519,6 +545,9 @@ def render_assistant(msg: dict):
         + "</div>",
         unsafe_allow_html=True,
     )
+    # 推理过程放在回答上方：常驻保留，随时可展开回看
+    if trace:
+        render_trace(trace)
     st.markdown(msg.get("content", ""))
 
     # 兜底：正文里未出现的图表，仍在末尾展示一次，避免漏图
@@ -552,10 +581,15 @@ def enqueue_query(text: str):
 
 
 def _stream_render(payload: dict):
-    """SSE 流式：实时渲染 思考 / 工具调用 / 观察结果，最后渲染最终回答与图表"""
+    """SSE 流式：实时渲染 思考 / 工具调用 / 观察结果，最后渲染最终回答与图表
+
+    返回 (final, events)：events 是本轮完整的推理事件序列，
+    会被写入消息状态，供「推理过程」折叠面板常驻保留（而不是一闪而过）。
+    """
     status_ph = st.empty()
     answer_ph = st.empty()
     lines: list[str] = []
+    events: list[dict] = []
     final = None
     try:
         with requests.post(f"{API_URL}/chat/stream", json=payload,
@@ -572,27 +606,48 @@ def _stream_render(payload: dict):
                     continue
                 t = ev.get("type")
                 if t == "thought":
+                    events.append(ev)
                     lines.append("思考  " + str(ev.get("text", ""))[:300])
                 elif t == "action":
+                    events.append(ev)
                     args = json.dumps(ev.get("args", {}), ensure_ascii=False)
                     lines.append(f"调用  {ev.get('tool')}({args})")
                 elif t == "observation":
+                    events.append(ev)
                     lines.append("结果  " + str(ev.get("text", ""))[:200])
                 elif t == "error":
+                    events.append(ev)
                     lines.append("异常  " + str(ev.get("text", "")))
                 elif t == "final":
                     final = ev
                 status_ph.code("\n".join(lines[-15:]) or "连接中…")
     except Exception as e:
         answer_ph.error(f"流式请求失败: {e}")
-        return None
+        return None, events
 
+    # 流式结束：清掉"进行中"的过程面板，随后 rerun 会由消息历史渲染常驻的推理过程面板
     status_ph.empty()
     if final:
         answer_ph.markdown(final.get("reply", ""))
         for img_url in final.get("images", []) or []:
             st.image(f"{API_URL}{img_url}")
-    return final
+    return final, events
+
+
+def _request_once(payload: dict) -> dict:
+    """一次性（非流式）请求后端 /chat；异常时返回可直接渲染的错误结构"""
+    try:
+        r = requests.post(f"{API_URL}/chat", json=payload, timeout=180)
+        try:
+            return r.json()
+        except Exception:
+            return {
+                "reply": f"后端返回异常（HTTP {r.status_code}）：{r.text[:200]}",
+                "images": [], "steps": [], "tokens": {},
+            }
+    except Exception as e:
+        return {"reply": f"请求后端失败: {e}",
+                "images": [], "steps": [], "tokens": {}}
 
 
 def process_pending():
@@ -618,45 +673,42 @@ def process_pending():
     if st.session_state.get("use_sse"):
         t0 = time.time()
         with st.chat_message("assistant"):
-            final = _stream_render(payload)
-        latency = time.time() - t0
-        if final is None:                      # 流式失败 → 回退一次性请求
-            st.session_state["pending_request"] = pending_text
-            st.session_state["use_sse"] = False
-            msgs.pop(pending_idx)
-            st.rerun()
-        resp = {
-            "reply": final.get("reply", ""),
-            "images": final.get("images", []) or [],
-            "steps": final.get("steps", []) or [],
-            "tokens": final.get("tokens") or {},
-            "needs_confirm": final.get("needs_confirm", False),
-        }
+            final, events = _stream_render(payload)
+        if final is None:
+            # 流式失败：本次直接改用一次性请求兜底。
+            # 注意：这里绝不能写 st.session_state["use_sse"] —— 该 key 已绑定 st.toggle 控件，
+            # 控件实例化后再赋值会抛 StreamlitWidgetAlreadyInstantiatedError。
+            with st.spinner("流式连接失败，改为一次性请求…"):
+                resp = _request_once(payload)
+            # 兜底请求若没带回轨迹，也保留流式期间收到的部分事件
+            if not resp.get("trace") and events:
+                resp["trace"] = events
+            latency = time.time() - t0
+        else:
+            resp = {
+                "reply": final.get("reply", ""),
+                "images": final.get("images", []) or [],
+                "steps": final.get("steps", []) or [],
+                "tokens": final.get("tokens") or {},
+                "trace": events,          # 常驻保留本轮推理过程
+                "needs_confirm": final.get("needs_confirm", False),
+            }
+            latency = time.time() - t0
     else:
         # 把"思考中"占位也立即渲染出来，让用户看到 Agent 已开工
         with st.chat_message("assistant"):
             render_assistant(msgs[pending_idx])
         t0 = time.time()
         with st.spinner("Agent 分析中…"):
-            try:
-                r = requests.post(f"{API_URL}/chat", json=payload, timeout=180)
-                try:
-                    resp = r.json()
-                except Exception:
-                    resp = {
-                        "reply": f"后端返回异常（HTTP {r.status_code}）：{r.text[:200]}",
-                        "images": [], "steps": [], "tokens": {},
-                    }
-            except Exception as e:
-                resp = {"reply": f"请求后端失败: {e}",
-                        "images": [], "steps": [], "tokens": {}}
+            resp = _request_once(payload)
         latency = time.time() - t0
 
     if resp.get("needs_confirm"):
         msgs[pending_idx] = {
             "role": "assistant",
             "content": resp.get("reply", "检测到高风险操作"),
-            "images": [], "steps": [], "tokens": {}, "latency_s": latency,
+            "images": [], "steps": [], "tokens": {}, "trace": [],
+            "latency_s": latency,
         }
         st.session_state["pending_confirm"] = resp.get("reply", "检测到高风险操作")
     else:
@@ -666,6 +718,7 @@ def process_pending():
             "images": resp.get("images", []),
             "steps": resp.get("steps", []),
             "tokens": resp.get("tokens") or {},
+            "trace": resp.get("trace") or [],      # 轨迹随消息留存，可反复展开回看
             "latency_s": latency,
         }
         t = resp.get("tokens") or {}

@@ -12,6 +12,8 @@ __pycache__/
 .pytest_cache/
 
 # ---- 运行期产物（保留目录本身）----
+logs/*
+!logs/.gitkeep
 charts/*
 !charts/.gitkeep
 reports/*
